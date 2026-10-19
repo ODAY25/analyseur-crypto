@@ -1,0 +1,87 @@
+name: Crypto market scanner
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Send a Telegram test message before scanning"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-scanner-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PYTHONPATH: src
+      DATABASE_URL: sqlite+aiosqlite:///./.state/analyseur.db
+      EXCHANGE_ID: bitget
+      SCAN_SYMBOLS: BTC/USDT,BNB/USDT,XRP/USDT,SOL/USDT,LTC/USDT,TRX/USDT
+      SCAN_TIMEFRAMES: 15m,1h,4h
+      MIN_CONFLUENCE_SCORE: "0.55"
+      MIN_RR_RATIO: "1.5"
+      REJECT_TREND_COUNTER: "true"
+      REQUIRE_VOLUME_EXPANSION: "false"
+      EXECUTION_MODE: disabled
+      TG_NOTIFY_TRIGGER: "true"
+      TG_NOTIFY_CLOSE: "true"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project
+        run: python -m pip install --upgrade pip && pip install -e .
+
+      - name: Prepare persistent state directory
+        run: mkdir -p .state
+
+      - name: Restore scanner database
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/analyseur.db
+          key: crypto-scanner-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            crypto-scanner-db-${{ github.ref_name }}-
+
+      - name: Validate Telegram configuration
+        shell: bash
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "::error::Missing TELEGRAM_BOT_TOKEN repository secret"; exit 1; }
+          test -n "$TELEGRAM_ADMIN_CHAT_ID" || { echo "::error::Missing TELEGRAM_ADMIN_CHAT_ID repository secret"; exit 1; }
+
+      - name: Send Telegram test message (manual runs only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_telegram }}
+        run: python scripts/telegram_test.py
+
+      - name: Initialize database
+        run: python scripts/init_db.py
+
+      - name: Scan crypto markets
+        run: python scripts/github_actions_scan.py
+
+      - name: Save scanner database
+        if: always() && hashFiles('.state/analyseur.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .state/analyseur.db
+          key: crypto-scanner-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
